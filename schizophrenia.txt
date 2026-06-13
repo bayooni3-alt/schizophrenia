@@ -1,0 +1,198 @@
+library(dplyr)
+library(tidyr)
+df <- read.csv("C:/Users/ADEBAYO/Documents/schizophrenia.csv")
+
+# Create a subject-level dataset with state at each time point
+state_data <- df %>%
+  dplyr::select(subject, onset, disorder, month) %>%  # Use dplyr::select explicitly
+  pivot_wider(names_from = month, 
+              values_from = disorder,
+              names_prefix = "month_")
+
+# View the transition data structure
+head(state_data)
+
+# Function to create transition matrix between two time points
+create_transition_matrix <- function(data, time1, time2) {
+  data %>%
+    filter(!is.na(.[[time1]]), !is.na(.[[time2]])) %>%
+    with(table(.[[time1]], .[[time2]]))
+}
+
+# Create transition matrix from month 0 to month 2
+trans_0_2 <- create_transition_matrix(state_data, "month_0", "month_2")
+print("Transition from Month 0 to Month 2:")
+print(trans_0_2)
+print(prop.table(trans_0_2, margin = 1)) # Row percentages (transition probabilities)
+
+```
+
+```{r}
+# Repeat for other time transitions
+trans_2_6 <- create_transition_matrix(state_data, "month_2", "month_6")
+trans_6_8 <- create_transition_matrix(state_data, "month_6", "month_8")
+trans_8_10 <- create_transition_matrix(state_data, "month_8", "month_10")
+
+library(MASS)
+
+# Prepare data for log-linear analysis
+# Create a dataset of all transitions
+transition_data <- df %>%
+  arrange(subject, month) %>%
+  group_by(subject) %>%
+  mutate(next_disorder = lead(disorder),
+         next_month = lead(month)) %>%
+  filter(!is.na(next_disorder)) %>%
+  ungroup() %>%
+  dplyr::select(subject, onset, month, disorder, next_month, next_disorder) %>%  # Use dplyr::select explicitly
+  filter(disorder != "" & next_disorder != "") # Remove empty factors if needed
+
+# Ensure factors are properly set
+transition_data$disorder <- factor(transition_data$disorder)
+transition_data$next_disorder <- factor(transition_data$next_disorder)
+transition_data$onset <- factor(transition_data$onset)
+
+# Create a contingency table for loglm
+transition_table <- with(transition_data, 
+                         table(disorder, next_disorder, onset))
+
+# Now fit log-linear model correctly
+loglin_model <- loglm(~ disorder + next_disorder + onset + disorder:next_disorder, 
+                      data = transition_table)
+
+summary(loglin_model)
+```
+
+
+```{r}
+library(nnet)
+
+# Ensure the data is properly formatted
+transition_data <- transition_data %>%
+  filter(disorder != "" & next_disorder != "") %>%
+  mutate(transition = paste(disorder, "->", next_disorder),
+         transition = as.factor(transition))
+
+# Fit multinomial logistic regression
+# Modeling the transition type based on onset group
+multinom_model <- multinom(transition ~ onset, data = transition_data)
+
+summary(multinom_model)
+```
+
+```{r}
+# Get predicted probabilities
+pred_probs <- fitted(multinom_model)
+head(pred_probs)
+
+# Test overall significance of onset
+null_model <- multinom(transition ~ 1, data = transition_data)
+
+# CORRECTION: Use anova from nnet package properly
+# You need to specify the test type
+anova_result <- anova(null_model, multinom_model)
+print(anova_result)
+
+```
+
+
+```{r}
+# Create a frequency table first
+freq_table <- transition_data %>%
+  count(disorder, next_disorder, onset, name = "freq")
+
+# Fit Poisson regression (equivalent to log-linear model)
+poisson_model <- glm(freq ~ disorder * next_disorder * onset, 
+                     family = poisson, 
+                     data = freq_table)
+
+summary(poisson_model)
+
+# Test specific effects
+drop1(poisson_model, test = "Chisq")
+```
+
+
+```{r}
+library(ggplot2)
+
+# Create transition network plot
+transition_summary <- transition_data %>%
+  group_by(disorder, next_disorder, onset) %>%
+  summarise(count = n(), .groups = 'drop') %>%
+  filter(disorder != "" & next_disorder != "")
+
+ggplot(transition_summary, aes(x = disorder, y = next_disorder, size = count, color = onset)) +
+  geom_point(alpha = 0.7) +
+  geom_text(aes(label = count), color = "black", size = 3) +
+  facet_wrap(~ onset) +
+  labs(title = "Disorder State Transitions by Onset Age Group",
+       x = "Current State", 
+       y = "Next State",
+       size = "Number of Transitions",
+       color = "Onset Age") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+
+```{r}
+# Test if transition probabilities follow a Markov process
+library(markovchain)
+
+# Create sequence of states for each subject
+subject_sequences <- df %>%
+  arrange(subject, month) %>%
+  group_by(subject) %>%
+  summarise(state_sequence = paste(disorder[disorder != ""], collapse = "->"),
+            onset_group = first(onset),
+            .groups = 'drop')
+
+# Fit Markov chain model
+# CORRECTION: Convert to character vector for markovchainFit
+sequence_vector <- as.character(subject_sequences$state_sequence)
+mc_fit <- markovchainFit(data = sequence_vector)
+print(mc_fit$estimate) # Transition probability matrix
+```
+
+```{r}
+# Test if transition matrices are homogeneous across groups
+# This requires more advanced analysis - simple example:
+early_onset <- subject_sequences %>% 
+  filter(onset_group == "< 20 yrs") %>% 
+  pull(state_sequence) %>% as.character()
+late_onset <- subject_sequences %>% 
+  filter(onset_group == "> 20 yrs") %>% 
+  pull(state_sequence) %>% as.character()
+
+mc_early <- markovchainFit(data = early_onset)$estimate
+mc_late <- markovchainFit(data = late_onset)$estimate
+
+cat("Early onset transition matrix:\n")
+print(mc_early)
+
+cat("\nLate onset transition matrix:\n")
+print(mc_late)
+```
+
+```{r}
+library(msm)
+# First, create a numeric state variable (required by msm)
+df <- df %>%
+  mutate(state_num = case_when(
+    disorder == "absent" ~ 1,
+    disorder == "present" ~ 2
+  ))
+# Fit an improved model with 'month' as a covariate on the transition intensities
+msm_model_time <- msm(state_num ~ month, subject = subject, data = df,
+                      covariates = list( "1-2" = ~ onset + month, 
+                                         "2-1" = ~ onset + month),
+                      qmatrix = matrix(c(NA, 1,  
+                                         1, NA), 
+                                       nrow = 2, byrow = TRUE))
+
+summary(msm_model_time)
+# The output will give you hazard ratios for the effect of 'onset' on each transition type.
+# e.g., A HR > 1 for onset[>20yrs] on the 1->2 transition means the late-onset group has a higher rate of relapse.
+
